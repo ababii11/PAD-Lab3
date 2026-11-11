@@ -9,6 +9,15 @@
     python run.py stop [--wipe]               stop everything (--wipe deletes data and logs)
 
 All settings are in config.json. In PyCharm use the ready-made run configurations.
+
+[RO] PE SCURT: acesta NU face parte din sistemul distribuit; e doar „telecomanda” care
+pornește procesele în ordinea corectă:
+    1. registrar  (9100)       -> trebuie să existe primul, ca să se poată înregistra ceilalți
+    2. proxy      (8080)
+    3. pentru i = 1..N:  mongod_i (27100+i), apoi node_i (8000+i)
+Fiecare proces rulează separat, în fundal. PID-ul lui se salvează în run/<nume>.json, ca
+`stop` să știe ce să oprească, iar log-ul în logs/<nume>.log. Setările ajung la procese prin
+variabile de mediu (vezi start_proxy / start_node_api), citite din config.json.
 """
 import argparse
 import glob

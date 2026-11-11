@@ -10,6 +10,14 @@ Nobody hard-codes the list of servers: a new node only needs the registrar's URL
 
 Optional (Linux alternative): when HAPROXY_API is set (e.g. 127.0.0.1:9999), the
 registrar also adds/removes the nodes in a running HAProxy through its Runtime API.
+
+[RO] PE SCURT: „cartea de telefon” a sistemului (port 9100).
+    - fiecare server trimite POST /register la 3 s („sunt node2, la http://127.0.0.1:8002”)
+    - sweeper() scoate din listă serverele care n-au mai trimis nimic de 10 s
+    - GET /nodes = lista serverelor vii; o citesc proxy-ul (unde trimit cererile?) și
+      serverele (de la cine copiez datele?)
+Astfel poți adăuga un server nou (`run.py add-node 4`) fără să modifici nimic în cod.
+Toată partea cu HAProxy e opțională (doar pe Linux) și pe Windows nu se folosește.
 """
 import asyncio
 import logging

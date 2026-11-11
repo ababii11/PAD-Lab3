@@ -11,6 +11,20 @@ HTTPX (async HTTP client with connection pooling). Our own code is only the poli
   * discovery       node list from the registrar, refreshed every second
   * web pages       /          HTML client (web/index.html)
                     /_proxy    dashboard with stop/start buttons (only from this machine)
+
+[RO] PE SCURT: proxy-ul este SINGURA adresă pe care o cunoaște clientul (:8080).
+Drumul unei cereri prin acest fișier (citește funcțiile în ordinea asta):
+
+    proxy()               punctul de intrare pentru orice cerere
+      -> filter_request() o respinge dacă e suspectă (403 / 405 / 413 / 429)
+      -> cached_get()     doar GET /movies în JSON: întâi caută în cache
+      -> forward()        alege un server cu choose() -> pick_p2c() și îi trimite cererea;
+                          dacă serverul nu răspunde, încearcă altul (failover)
+      -> cache.clear()    după orice scriere reușită (POST/PUT/DELETE)
+
+În paralel rulează două bucle de fundal (vezi lifespan(), la final):
+    refresh_nodes()  la 1 s: ia lista serverelor de la registrar (service discovery)
+    check_all()      la 2 s: GET /health pe fiecare server -> marcat UP sau DOWN
 """
 import asyncio
 import hashlib
@@ -75,6 +89,9 @@ class Backend:
         self.status: dict = {}           # last /sync/status answer (for the dashboard)
 
     def record_check(self, ok: bool) -> None:
+        # [RO] Un singur eșec NU scoate serverul din rotație: trebuie FALL=2 eșecuri la rând
+        # ca să devină DOWN și RISE=2 reușite la rând ca să redevină UP. Așa o cerere lentă
+        # izolată nu face serverul să „pâlpâie” între UP și DOWN.
         if ok:
             self.oks, self.fails = self.oks + 1, 0
             if not self.up and self.oks >= RISE:
@@ -98,6 +115,12 @@ def pick_p2c(cands: list[Backend]) -> Backend:
     Same idea as HAProxy's `balance random(2)`. Cheap (no global scan), and it avoids
     both the herd effect of always-pick-the-least-loaded and the blindness of random.
     """
+    # [RO] ALGORITMUL CERUT ÎN LABORATOR. Exemplu: node1 are 3 cereri în lucru, node2 are 0,
+    # node3 are 1. Tragem la sorți două, de exemplu node1 și node3: câștigă node3 (1 < 3).
+    # `active` = câte cereri are serverul în lucru ACUM (crește/scade în send_once()).
+    # Împărțirea la `weight` face ca un server cu weight=200 să poată duce dublu.
+    # De ce nu mereu „cel mai liber”: toate cererile simultane ar vedea același server
+    # ca fiind cel mai liber și s-ar năpusti toate pe el (efectul de turmă).
     if len(cands) == 1:
         return cands[0]
     a, b = random.sample(cands, 2)
@@ -125,7 +148,9 @@ def pick_roundrobin(cands: list[Backend]) -> Backend:
 
 
 def choose(client_ip: str, exclude: set[str]) -> Backend | None:
-    cands = [b for b in backends.values() if b.up and b.name not in exclude]
+    # [RO] Candidați = serverele marcate UP de health check, minus cele încercate deja
+    # pentru cererea curentă (`exclude`, folosit la failover în forward()).
+    cands =[b for b in backends.values() if b.up and b.name not in exclude]
     if not cands:
         return None
     if LB_ALGO == "leastconn":
@@ -143,6 +168,9 @@ http: httpx.AsyncClient
 
 async def refresh_nodes() -> None:
     """Take the live node list from the registrar."""
+    # [RO] SERVICE DISCOVERY: proxy-ul nu are lista serverelor scrisă în cod. O cere de la
+    # registrar în fiecare secundă. Un server nou apare singur, iar unul care nu mai trimite
+    # heartbeat dispare după ~10 s (registrar/main.py, NODE_TTL).
     try:
         r = await http.get(f"{REGISTRAR_URL}/nodes", timeout=2)
         listed = {n["name"]: n for n in r.json()["nodes"]}
@@ -168,6 +196,8 @@ async def add_or_update(name: str, url: str, weight: int) -> None:
 
 
 async def health_check(b: Backend) -> None:
+    # [RO] /health (dw_node/main.py) răspunde 200 doar dacă și MongoDB-ul serverului
+    # răspunde. Un server cu baza căzută primește 503, deci nu mai primește trafic.
     try:
         r = await http.get(f"{b.url}/health", timeout=1.5)
         b.record_check(r.status_code == 200)
@@ -201,6 +231,12 @@ async def repeat(fn, interval: float) -> None:
 class Cache:
     """key -> (stored_at, status, headers, body). Fresh for CACHE_TTL s, usable as a
     last resort ("stale") for STALE_TTL s when no node can answer."""
+
+    # [RO] Cache în memoria proxy-ului. O intrare are două „vârste”:
+    #   0-5 s     proaspătă -> servită direct, fără server        (X-Cache-Status: HIT)
+    #   5-65 s    expirată  -> folosită DOAR dacă niciun server nu răspunde (STALE)
+    #   peste 65 s           -> inutilizabilă; dacă toate serverele sunt jos -> 503
+    # Cheia este calea + query-ul, de ex. "/movies?offset=0&limit=10".
 
     def __init__(self) -> None:
         self.entries: dict[str, tuple] = {}
@@ -255,6 +291,8 @@ def deny(status: int, reason: str) -> Response:
 
 
 def rate_limited(ip: str) -> bool:
+    # [RO] „Fereastră glisantă”: păstrăm momentele cererilor din ultimele 10 s pentru
+    # fiecare IP. Dacă sunt deja 100, cererea nouă primește 429 (Too Many Requests).
     now, times = time.monotonic(), recent[ip]
     while times and times[0] < now - RATE_WINDOW:
         times.popleft()
@@ -265,6 +303,9 @@ def rate_limited(ip: str) -> bool:
 
 
 def filter_request(request: Request, ip: str) -> Response | None:
+    # [RO] FILTRAREA TRAFICULUI. Returnează un răspuns de eroare dacă cererea trebuie
+    # oprită, sau None dacă poate merge mai departe. /sync, /health etc. sunt interne
+    # (folosite doar între servere), deci clienții din afară nu au voie la ele.
     if request.method not in ALLOWED_METHODS:
         return deny(405, "method not allowed")
     if request.url.path.startswith(BLOCKED_PATHS):
@@ -312,6 +353,14 @@ def retry_elsewhere(request: Request, r: httpx.Response) -> bool:
 
 async def forward(request: Request, body: bytes, ip: str, rid: str) -> Response:
     """Send to a node chosen by the algorithm; fail over when it is safe to do so."""
+    # [RO] FAILOVER. Bucla încearcă servere până unul răspunde. Regula importantă este
+    # CÂND e voie să reîncercăm pe alt server fără să dublăm o scriere:
+    #   - conexiune refuzată       -> cererea n-a ajuns deloc -> reîncercăm (chiar și POST)
+    #   - 503 + X-Retry-Safe       -> serverul zice „baza mea e jos, n-am salvat nimic” -> reîncercăm
+    #   - 503 la GET               -> o citire se poate repeta oricând -> reîncercăm
+    #   - timeout (15 s)           -> NU reîncercăm: poate a salvat deja, iar un retry ar crea
+    #                                 filmul de două ori -> 504
+    # Dacă nu mai rămâne niciun server -> 503 „no healthy node available”.
     headers, tried = upstream_headers(request, ip, rid), set()
     while (b := choose(ip, tried)) is not None:
         tried.add(b.name)
@@ -341,6 +390,9 @@ async def cached_get(request: Request, body: bytes, ip: str, rid: str) -> Respon
     if (entry := cache.fresh(key)) is not None:
         cache.hits += 1
         return from_cache(entry, "HIT")
+    # [RO] Când intrarea expiră și vin 50 de cereri simultan, doar PRIMA merge la server.
+    # Celelalte așteaptă la lacăt și apoi găsesc intrarea proaspătă (a doua verificare de
+    # mai jos). Fără asta, toate 50 ar lovi serverele deodată („cache stampede”).
     async with cache.locks[key]:                   # one request refills, the others wait
         if (entry := cache.fresh(key)) is not None:
             cache.hits += 1
@@ -358,7 +410,10 @@ async def cached_get(request: Request, body: bytes, ip: str, rid: str) -> Respon
 
 
 async def proxy(request: Request) -> Response:
-    ip = request.client.host if request.client else "?"
+    # [RO] PUNCTUL DE INTRARE pentru orice cerere a clientului (în afară de / și /_proxy).
+    # 1) filtrare  2) GET /movies -> prin cache; altfel -> direct la un server
+    # 3) după o scriere reușită golim TOT cache-ul, ca utilizatorul să-și vadă imediat schimbarea
+    ip =request.client.host if request.client else "?"
     rid = uuid.uuid4().hex[:16]
     counters["requests"] += 1
     resp = filter_request(request, ip)
@@ -384,7 +439,9 @@ def local_only(request: Request) -> bool:
 
 
 def server_light(name: str) -> tuple[str, str]:
-    b = backends.get(name)
+    # [RO] Culorile din dashboard: verde = UP în proxy; galben = procesul trăiește, dar
+    # health check-ul încă nu trece (pornește acum sau are baza căzută); roșu = oprit.
+    b =backends.get(name)
     if b and b.up:
         return "green", "running"
     if launcher.is_running(name) or (b and b.status):
@@ -447,6 +504,8 @@ async def client_page(request: Request) -> Response:
     return FileResponse(ROOT / "web" / "index.html")
 
 
+# [RO] Butoanele Stop/Start din dashboard opresc și pornesc PROCESE REALE, prin aceleași
+# funcții din run.py pe care le folosești în terminal. Căderea nu e simulată.
 CONTROL = {
     ("server", "stop"): lambda i: launcher.stop(f"node{i}"),
     ("server", "start"): lambda i: launcher.start_node_api(i),
@@ -476,6 +535,8 @@ async def control(request: Request) -> Response:
 # ============================ app ============================
 @asynccontextmanager
 async def lifespan(app):
+    # [RO] Rulează o dată la pornirea proxy-ului: creează clientul HTTP (cu pool de conexiuni)
+    # și pornește cele două bucle de fundal. Tot ce e după `yield` rulează la oprire.
     global http
     http = httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=2.0),
                              limits=httpx.Limits(max_connections=200, max_keepalive_connections=50))
@@ -488,6 +549,8 @@ async def lifespan(app):
     await http.aclose()
 
 
+# [RO] Rutele: primele 4 sunt ale proxy-ului însuși; ultima („orice altceva”) se trimite
+# mai departe la servere prin proxy().
 app = Starlette(lifespan=lifespan, routes=[
     Route("/", client_page),
     Route("/_proxy", dashboard),

@@ -15,6 +15,13 @@ Internal API (node-to-node sync; HAProxy blocks it from the outside):
     POST /sync/docs               full documents for a list of ids
     GET  /sync/checksum           hash of the whole data set (to compare nodes)
     GET  /info                    node status
+
+[RO] PE SCURT: acesta e un SERVER DE APLICAȚIE (pornit de 3 ori: node1/2/3, porturile 8001-8003).
+Fiecare are propria bază MongoDB. Fișierul conține doar rutele HTTP; munca e în altă parte:
+    store.py   tot ce atinge MongoDB (scrieri în tranzacție, regula de conflict)
+    sync.py    ce rulează în fundal (heartbeat la registrar, copierea schimbărilor de la ceilalți)
+    formats.py răspuns JSON sau XML, după cum cere clientul
+Nodul nu știe nimic de proxy: proxy-ul doar îi trimite cereri.
 """
 import logging
 import uuid
@@ -41,6 +48,8 @@ syncer = Syncer(store)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # [RO] La pornire: conectare la MongoDB (și inițializarea replica set-ului, dacă e nou),
+    # apoi pornesc buclele de sincronizare din sync.py. La oprire: anunță registrarul că pleacă.
     await store.init()
     syncer.start()
     log.info("node %s ready at %s", settings.NODE_NAME, settings.ADVERTISE_URL)
@@ -54,6 +63,9 @@ app = FastAPI(title=f"DW node {settings.NODE_NAME}", lifespan=lifespan)
 @app.exception_handler(PyMongoError)
 async def database_unavailable(request: Request, exc: PyMongoError):
     """Our MongoDB is down: answer 503 so the proxy can use another node."""
+    # [RO] Orice eroare de bază de date dintr-o rută ajunge aici în loc de un 500 urât.
+    # Antetul X-Retry-Safe îi spune proxy-ului: „sigur n-am scris nimic, trimite cererea
+    # la alt server”. Vezi retry_elsewhere() în proxy/main.py.
     log.warning("database error: %s", exc)
     # No server could even be selected, so nothing was written: the proxy may safely
     # resend this request (even a POST) to another node.
@@ -73,6 +85,8 @@ async def add_node_header(request: Request, call_next):
     return response
 
 
+# [RO] Validarea datelor primite (Pydantic): titlu obligatoriu, an 1870-2100, rating 0-10.
+# Dacă nu se respectă, FastAPI răspunde automat 422, fără să ajungă în baza de date.
 class MovieIn(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     year: int | None = Field(default=None, ge=1870, le=2100)
@@ -82,6 +96,8 @@ class MovieIn(BaseModel):
 
 
 def parse_if_match(value: str | None) -> int | None:
+    # [RO] If-Match: "3" înseamnă „modifică doar dacă filmul e încă la versiunea 3”.
+    # Clientul web îl trimite la Edit: dacă între timp altcineva a salvat -> 409 Conflict.
     if not value or value.strip() == "*":
         return None
     value = value.strip().removeprefix("W/").strip('"')
@@ -102,6 +118,8 @@ def etag(doc: dict) -> dict:
 # ---------------- public API ----------------
 @app.get("/health")
 async def health():
+    # [RO] Proxy-ul apelează asta la fiecare 2 s. „Sănătos” = procesul răspunde ȘI baza lui
+    # răspunde. De aceea, când oprești doar baza, serverul iese singur din rotație.
     if await store.ping():
         return {"status": "ok", "node": settings.NODE_NAME}
     return Response('{"status":"db-down"}', status_code=503, media_type="application/json")
@@ -126,7 +144,9 @@ async def get_movie(request: Request, movie_id: str):
 
 @app.post("/movies", status_code=201)
 async def create_movie(request: Request, movie: MovieIn):
-    doc = await store.local_write(str(uuid.uuid4()), movie.model_dump(),
+    # [RO] Id-ul e un UUID generat aici, pe server. Două servere care creează filme în
+    # același timp nu pot alege niciodată același id, deci nu trebuie să se coordoneze.
+    doc =await store.local_write(str(uuid.uuid4()), movie.model_dump(),
                                   expected_version=None, must_exist=False)
     out = public(doc)
     return respond(request, out, root="movie", status=201,
@@ -163,6 +183,10 @@ async def delete_movie(request: Request, movie_id: str,
 
 
 # ---------------- internal sync API ----------------
+# [RO] Rutele de mai jos sunt folosite DOAR de celelalte servere (sync.py) și de dashboard.
+# Proxy-ul le blochează pentru clienți (403). Le poți deschide direct în browser pe portul
+# serverului, de ex. http://127.0.0.1:8001/sync/checksum: dacă hash-ul e identic pe toate
+# 3 serverele, bazele lor de date conțin exact aceleași date.
 @app.get("/sync/changes")
 async def sync_changes(since: int = Query(0, ge=0), limit: int = Query(500, ge=1, le=5000)):
     return await store.changes_since(since, limit)

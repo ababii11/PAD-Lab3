@@ -4,6 +4,18 @@
   * pull        -- change feed: GET <peer>/sync/changes?since=N from every peer
   * reconcile   -- full comparison with every peer, repairs anything missed
   * trim        -- delete old change-log entries and old tombstones
+
+[RO] PE SCURT: patru bucle care rulează continuu pe fiecare server, în fundal:
+    heartbeat()      la 3 s:  „sunt viu la adresa X” către registrar; primește înapoi lista
+                              celorlalte servere (peers)
+    pull_all()       la 2 s:  de la FIECARE peer cere doar schimbările noi (după ultimul număr
+                              primit) și le aplică cu regula de conflict
+    reconcile_all()  la 60 s: compară lista completă (id, version, node) cu fiecare peer și
+                              copiază ce lipsește; e plasa de siguranță pentru ce n-a prins pull-ul
+    trim()           la 10 min: curăță jurnalul vechi
+Este un model „PULL”: fiecare server își ia singur datele de la ceilalți. Un server căzut
+nu blochează pe nimeni; când revine, cere tot ce a pierdut, pornind de la ultimul număr
+salvat în baza lui (colecția `peers`).
 """
 import asyncio
 import logging
@@ -87,6 +99,8 @@ class Syncer:
             log.warning("registrar unreachable (%s); keeping last known peers", exc)
             return
         new_peers = {n["name"]: n["url"] for n in nodes if n["name"] != settings.NODE_NAME}
+        # [RO] Un peer văzut prima dată (sau unul care a revenit) primește o comparație
+        # completă, nu doar pull: e cel mai sigur mod de a recupera după o absență.
         for name in new_peers.keys() - self.peers.keys():
             log.info("discovered peer %s at %s", name, new_peers[name])
             self._reconcile_now.add(name)       # first contact: full comparison
@@ -110,7 +124,12 @@ class Syncer:
                                                         error=str(exc))
 
     async def pull_from(self, name: str, url: str) -> int:
-        state = await self.store.get_peer(name) or {}
+        # [RO] Exemplu: ultima dată am primit de la node2 până la nr. 17 (salvat în baza
+        # noastră). Cerem /sync/changes?since=17 și primim 18, 19, 20; le aplicăm și salvăm 20.
+        # Pentru că poziția stă în baza de date, nu în memorie, un restart nu pierde nimic.
+        # Două cazuri speciale: peer-ul are bază nouă (alt `instance`) -> o luăm de la 0;
+        # intrările de care avem nevoie au fost șterse („gap”) -> comparație completă.
+        state =await self.store.get_peer(name) or {}
         last = state.get("last_seq", 0)
         applied = 0
         while True:
@@ -156,7 +175,10 @@ class Syncer:
 
     async def reconcile_with(self, name: str, url: str) -> int:
         """Compare (id, version, node) lists and copy every record the peer has newer."""
-        r = await self.http.get(f"{url}/sync/digest")
+        # [RO] Pasul 1: luăm de la peer doar „cuprinsul” (id, version, node) pentru toate filmele.
+        # Pasul 2: îl comparăm cu al nostru și cerem documentele complete doar pentru cele la
+        # care peer-ul e mai nou sau pe care nu le avem deloc.
+        r =await self.http.get(f"{url}/sync/digest")
         r.raise_for_status()
         theirs = r.json()["items"]
         mine = {i: {"version": v, "node": n} for i, v, n in await self.store.digest()}

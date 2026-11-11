@@ -16,6 +16,16 @@ Other collections:
     counters  {_id: "changes", n}  -- last used sequence number
     peers     {_id: peer name, last_seq, instance, url}  -- how far we pulled
     meta      {_id: "instance", value}  -- random id of this database
+
+[RO] IDEEA DE BAZĂ A SINCRONIZĂRII. Fiecare film are `version` (1, 2, 3, ... crește la
+fiecare modificare) și `node` (serverul care a făcut ultima modificare). Când două servere
+au versiuni diferite ale aceluiași film, câștigă perechea mai mare (version, node):
+    (3, "node1") vs (2, "node3")  -> câștigă node1, pentru că versiunea 3 > 2
+    (3, "node1") vs (3, "node2")  -> câștigă node2, aceeași versiune, iar „node2” > „node1”
+Toate serverele aplică aceeași regulă, deci ajung toate la același rezultat. Ora NU se
+folosește, pentru că ceasurile serverelor pot diferi.
+Ștergerea nu șterge efectiv documentul: îl marchează `deleted: True` („tombstone”), ca
+să poată fi sincronizată ca orice altă modificare.
 """
 import asyncio
 import hashlib
@@ -77,6 +87,9 @@ class Store:
 
     # ---------- startup ----------
     async def init(self) -> None:
+        # [RO] MongoDB permite tranzacții doar în mod „replica set”. De aceea fiecare mongod
+        # e pornit ca replica set cu UN SINGUR membru. Nu e replicare între servere: fiecare
+        # bază rămâne independentă, iar sincronizarea o facem noi în sync.py.
         # Check / initiate the replica set with a temporary client, then open the
         # real one: a client that first saw an uninitiated server would keep
         # treating it as a standalone server (no sessions, no transactions).
@@ -164,6 +177,13 @@ class Store:
         fields=None means delete (store a tombstone).
         expected_version enables optimistic concurrency (HTTP If-Match).
         """
+        # [RO] ORICE create/update/delete trece pe aici. În aceeași tranzacție:
+        #   1. citim versiunea curentă (verificăm If-Match -> VersionConflict -> 409)
+        #   2. salvăm filmul cu version+1 și node=numele nostru
+        #   3. luăm următorul număr de secvență (1, 2, 3, ...) din `counters`
+        #   4. scriem schimbarea în jurnalul `changes` cu acel număr
+        # Ori se salvează toate, ori nimic. Nu poate exista un film modificat care să lipsească
+        # din jurnal, deci celelalte servere nu pot rata o schimbare.
         result: dict = {}
 
         async def txn(session):
@@ -207,6 +227,10 @@ class Store:
         Remote changes are NOT written to our change log: every node pulls from
         every other node directly, so re-logging would only echo changes back.
         """
+        # [RO] Aici se aplică regula de conflict, direct în MongoDB: „înlocuiește documentul
+        # doar dacă al nostru are (version, node) MAI MIC”. Dacă al nostru e mai nou, filtrul
+        # nu găsește nimic, upsert-ul încearcă să insereze un _id existent -> DuplicateKeyError
+        # -> ignorăm. Aplicată de 2 ori, aceeași schimbare nu strică nimic (idempotentă).
         newer_than_ours = {
             "_id": doc["_id"],
             "$or": [
@@ -222,7 +246,10 @@ class Store:
 
     # ---------- change feed ----------
     async def changes_since(self, since: int, limit: int) -> dict:
-        counter = await self.db.counters.find_one({"_id": "changes"})
+        # [RO] Răspunsul la GET /sync/changes?since=N: „dă-mi tot ce ai scris după numărul N”.
+        # min_seq îi spune celuilalt server dacă intrările de care are nevoie mai există
+        # (cele mai vechi de 24 h se șterg, vezi trim()).
+        counter =await self.db.counters.find_one({"_id": "changes"})
         max_seq = counter["n"] if counter else 0
         first = await self.db.changes.find_one({}, sort=[("seq", ASCENDING)])
         min_seq = first["seq"] if first else max_seq + 1
