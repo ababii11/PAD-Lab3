@@ -59,6 +59,10 @@ def main() -> None:
     print(f"  all nodes identical after {wait_in_sync():.2f} s  {checksums()}")
 
     title("4. Cache in the proxy (5 s micro-cache)")
+    h = http.get("/movies").headers
+    print(f"  right after a write: X-Cache-Status={h['x-cache-status']:<4}  answered by "
+          f"{h['x-node']} (the writer; nothing cached for write_settle_s)")
+    time.sleep(5.2)   # wait out the proxy's write-settle window (config.json: write_settle_s)
     for _ in range(3):
         h = http.get("/movies").headers
         print(f"  X-Cache-Status={h['x-cache-status']:<4}  answered by {h['x-node']}")

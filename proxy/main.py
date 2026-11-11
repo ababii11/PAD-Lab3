@@ -56,6 +56,9 @@ STALE_TTL = float(os.environ.get("STALE_TTL", "60"))
 RATE_LIMIT = int(os.environ.get("RATE_LIMIT", "100"))
 RATE_WINDOW = float(os.environ.get("RATE_WINDOW", "10"))
 MAX_CONN_PER_IP = int(os.environ.get("MAX_CONN_PER_IP", "20"))
+# After a write, the other nodes need up to ~2 s (their pull interval) to copy it.
+# For this long, reads go to the node that made the write and are not cached.
+WRITE_SETTLE = float(os.environ.get("WRITE_SETTLE", "5"))
 MAX_BODY = 64 * 1024
 HEALTH_INTERVAL, FALL, RISE = 2.0, 2, 2
 
@@ -261,6 +264,29 @@ class Cache:
 
 cache = Cache()
 
+# [RO] PROBLEMA REZOLVATĂ AICI: după un Add/Edit pe node2, clientul cere imediat lista.
+# Golirea cache-ului nu ajunge: P2C putea trimite citirea la node1, care încă n-a copiat
+# schimbarea (sync la 2 s), iar lista VECHE intra în cache și era servită încă 5 s.
+# Așa părea că filmul nou „lipsește” sau că editarea „nu s-a salvat” (în testele noastre,
+# în 8 din 10 cazuri). Acum, timp de WRITE_SETTLE secunde după o scriere:
+#   - citirile merg la serverul care a făcut scrierea (el sigur are datele noi);
+#   - nimic nu se pune în cache, ca o copie veche să nu poată fi păstrată.
+# După fereastră, toate serverele au schimbarea, iar cache-ul și P2C lucrează normal.
+last_write: tuple[str, float] | None = None    # (node that made the write, monotonic time)
+
+
+def note_write(node: str) -> None:
+    global last_write
+    last_write = (node, time.monotonic())
+    cache.clear()                               # lists and items may have changed
+
+
+def settling_writer() -> str | None:
+    """The node of the latest write, while the other nodes may still lack it."""
+    if last_write and time.monotonic() - last_write[1] < WRITE_SETTLE:
+        return last_write[0]
+    return None
+
 
 def is_cacheable(request: Request) -> bool:
     return (request.method == "GET" and request.url.path.startswith("/movies")
@@ -351,6 +377,15 @@ def retry_elsewhere(request: Request, r: httpx.Response) -> bool:
     return request.method in SAFE_METHODS or r.headers.get("x-retry-safe") == "1"
 
 
+def pick_for(request: Request, ip: str, tried: set[str]) -> Backend | None:
+    """Reads right after a write go to the node that made it (read-your-writes)."""
+    writer = settling_writer() if request.method in SAFE_METHODS else None
+    b = backends.get(writer) if writer else None
+    if b is not None and b.up and b.name not in tried:
+        return b
+    return choose(ip, tried)
+
+
 async def forward(request: Request, body: bytes, ip: str, rid: str) -> Response:
     """Send to a node chosen by the algorithm; fail over when it is safe to do so."""
     # [RO] FAILOVER. Bucla încearcă servere până unul răspunde. Regula importantă este
@@ -362,7 +397,7 @@ async def forward(request: Request, body: bytes, ip: str, rid: str) -> Response:
     #                                 filmul de două ori -> 504
     # Dacă nu mai rămâne niciun server -> 503 „no healthy node available”.
     headers, tried = upstream_headers(request, ip, rid), set()
-    while (b := choose(ip, tried)) is not None:
+    while (b := pick_for(request, ip, tried)) is not None:
         tried.add(b.name)
         try:
             r = await send_once(b, request, body, headers)
@@ -398,7 +433,11 @@ async def cached_get(request: Request, body: bytes, ip: str, rid: str) -> Respon
             cache.hits += 1
             return from_cache(entry, "HIT")
         resp = await forward(request, body, ip, rid)
-        if resp.status_code == 200 and "json" in resp.headers.get("content-type", ""):
+        # Checked AFTER the read: a write made while it was in flight also blocks storing.
+        # shortcut: a read slower than WRITE_SETTLE that started before a write could still be
+        # cached for CACHE_TTL s; compare timestamps if reads ever get that slow.
+        if (resp.status_code == 200 and settling_writer() is None
+                and "json" in resp.headers.get("content-type", "")):
             cache.put(key, resp)
         elif resp.status_code >= 500 and (old := cache.stale_copy(key)) is not None:
             cache.stale += 1
@@ -412,8 +451,8 @@ async def cached_get(request: Request, body: bytes, ip: str, rid: str) -> Respon
 async def proxy(request: Request) -> Response:
     # [RO] PUNCTUL DE INTRARE pentru orice cerere a clientului (în afară de / și /_proxy).
     # 1) filtrare  2) GET /movies -> prin cache; altfel -> direct la un server
-    # 3) după o scriere reușită golim TOT cache-ul, ca utilizatorul să-și vadă imediat schimbarea
-    ip =request.client.host if request.client else "?"
+    # 3) după o scriere reușită golim TOT cache-ul și pornim fereastra WRITE_SETTLE (vezi note_write)
+    ip = request.client.host if request.client else "?"
     rid = uuid.uuid4().hex[:16]
     counters["requests"] += 1
     resp = filter_request(request, ip)
@@ -426,7 +465,7 @@ async def proxy(request: Request) -> Response:
             else:
                 resp = await forward(request, body, ip, rid)
                 if request.method not in SAFE_METHODS and resp.status_code < 300:
-                    cache.clear()              # lists and items may have changed
+                    note_write(resp.headers.get("X-Upstream", ""))
         finally:
             open_conns[ip] -= 1
     resp.headers["X-Request-ID"] = rid

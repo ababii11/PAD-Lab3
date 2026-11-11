@@ -4,6 +4,7 @@
     "algorithm": "p2c",
     "cache_ttl_s": 5,
     "stale_ttl_s": 60,
+    "write_settle_s": 5,
     "rate_limit_requests": 100,
     "rate_limit_window_s": 10,
     "max_connections_per_ip": 20

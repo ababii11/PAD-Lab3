@@ -193,6 +193,7 @@ def start_proxy(algo: str) -> None:
                     "--port", str(p["port"]), "--no-access-log"],
           {"LB_ALGO": algo, "REGISTRAR_URL": REGISTRAR_URL,
            "CACHE_TTL": str(p["cache_ttl_s"]), "STALE_TTL": str(p["stale_ttl_s"]),
+           "WRITE_SETTLE": str(p.get("write_settle_s", 5)),
            "RATE_LIMIT": str(p["rate_limit_requests"]),
            "RATE_WINDOW": str(p["rate_limit_window_s"]),
            "MAX_CONN_PER_IP": str(p["max_connections_per_ip"])})

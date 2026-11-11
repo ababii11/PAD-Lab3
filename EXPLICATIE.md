@@ -61,7 +61,9 @@ Regula de failover, adică **când e voie să trimiți cererea la alt server**:
 
 ### Cache
 - Răspunsurile `GET /movies` se păstrează **5 s** (`HIT`).
-- După orice scriere, cache-ul se golește, ca să-ți vezi imediat modificarea.
+- După orice scriere, cache-ul se golește și, timp de **5 s**, citirile merg la serverul care a
+  făcut scrierea și **nu se pun în cache**. Altfel citirea putea ajunge la un server care încă
+  n-a copiat schimbarea, iar lista veche ar fi stat în cache 5 s („read-your-writes”).
 - Dacă **toate** serverele sunt căzute, se servește o copie veche de până la **60 s** (`STALE`)
   în loc de eroare. Scrierile primesc `503`.
 - Când expiră o intrare, doar o cerere merge la server, iar celelalte așteaptă (protecție la „cache stampede”).
@@ -71,7 +73,8 @@ Fiecare film are **`version`** (crește la fiecare modificare) și **`node`** (c
 
 1. **Scriere locală în tranzacție:** filmul și intrarea în jurnal se salvează împreună sau deloc.
 2. **Pull la 2 s:** fiecare server cere de la ceilalți „schimbările după nr. N”. Ține minte N
-   în propria bază, deci după un restart continuă de unde a rămas.
+   în propria bază, deci după un restart continuă de unde a rămas. Fiecare peer are **bucla lui
+   separată**, așa că un server căzut sau lent nu întârzie sincronizarea dintre celelalte.
 3. **Regula de conflict, aceeași pe toate serverele:** câștigă perechea mai mare `(version, node)`.
    Ceasul nu se folosește, pentru că ceasurile serverelor pot diferi.
 4. **Ștergerea e „tombstone”** (`deleted: true`), ca să se sincronizeze ca orice altă schimbare

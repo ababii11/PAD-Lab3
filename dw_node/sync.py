@@ -8,8 +8,8 @@
 [RO] PE SCURT: patru bucle care rulează continuu pe fiecare server, în fundal:
     heartbeat()      la 3 s:  „sunt viu la adresa X” către registrar; primește înapoi lista
                               celorlalte servere (peers)
-    pull_all()       la 2 s:  de la FIECARE peer cere doar schimbările noi (după ultimul număr
-                              primit) și le aplică cu regula de conflict
+    pull_peer()      la 2 s, câte o buclă SEPARATĂ pentru fiecare peer: cere doar schimbările
+                              noi (după ultimul număr primit) și le aplică cu regula de conflict
     reconcile_all()  la 60 s: compară lista completă (id, version, node) cu fiecare peer și
                               copiază ce lipsește; e plasa de siguranță pentru ce n-a prins pull-ul
     trim()           la 10 min: curăță jurnalul vechi
@@ -36,6 +36,7 @@ class Syncer:
         self.peers: dict[str, str] = {}          # name -> url, from the registrar
         self.status: dict[str, dict] = {}        # name -> last result, for /info
         self._tasks: list[asyncio.Task] = []
+        self._peer_tasks: dict[str, asyncio.Task] = {}   # one pull loop per peer
         self._reconcile_now: set[str] = set()
         self._last_applied = 0.0                 # when we last copied a change from a peer
 
@@ -58,14 +59,14 @@ class Syncer:
     def start(self) -> None:
         self._tasks = [
             asyncio.create_task(self._loop(self.heartbeat, settings.HEARTBEAT_INTERVAL)),
-            asyncio.create_task(self._loop(self.pull_all, settings.PULL_INTERVAL)),
+            # pull loops are started per peer by heartbeat() -> _update_peer_tasks()
             asyncio.create_task(self._loop(self.reconcile_all, settings.RECONCILE_INTERVAL,
                                            first_delay=3)),
             asyncio.create_task(self._loop(self.store.trim, 600)),
         ]
 
     async def stop(self) -> None:
-        for task in self._tasks:
+        for task in [*self._tasks, *self._peer_tasks.values()]:
             task.cancel()
         try:
             await self.http.post(f"{settings.REGISTRAR_URL}/deregister",
@@ -75,7 +76,7 @@ class Syncer:
         await self.http.aclose()
 
     @staticmethod
-    async def _loop(fn, interval: float, first_delay: float = 0) -> None:
+    async def _loop(fn, interval: float, first_delay: float = 0, name: str = "") -> None:
         if first_delay:
             await asyncio.sleep(first_delay)
         while True:
@@ -84,7 +85,7 @@ class Syncer:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                log.warning("%s failed: %s", fn.__name__, exc)
+                log.warning("%s failed: %s", name or fn.__name__, exc)
             await asyncio.sleep(interval)
 
     # ---------- service discovery ----------
@@ -105,23 +106,37 @@ class Syncer:
             log.info("discovered peer %s at %s", name, new_peers[name])
             self._reconcile_now.add(name)       # first contact: full comparison
         self.peers = new_peers
+        self._update_peer_tasks()
 
     # ---------- change feed (pull) ----------
-    async def pull_all(self) -> None:
-        for name, url in list(self.peers.items()):
-            try:
-                if name in self._reconcile_now:
-                    await self.reconcile_with(name, url)
-                    self._reconcile_now.discard(name)
-                applied = await self.pull_from(name, url)
-                self.status.setdefault(name, {}).update(
-                    url=url, reachable=True, caught_up=True, last_pull=time.time())
-                if applied:
-                    self._last_applied = time.time()
-                    log.info("pulled %d change(s) from %s", applied, name)
-            except httpx.HTTPError as exc:
-                self.status.setdefault(name, {}).update(url=url, reachable=False,
-                                                        error=str(exc))
+    # [RO] Fiecare peer are BUCLA LUI de pull, separată. Înainte exista o singură buclă care
+    # lua peer-ii pe rând: un peer cu baza căzută (care răspunde 503 abia după ~3 s) îi
+    # ținea pe toți ceilalți la coadă, deci sincronizarea dintre serverele sănătoase
+    # încetinea de la ~0,5 s la ~5 s. Acum un peer lent sau căzut îl încetinește doar pe el.
+    def _update_peer_tasks(self) -> None:
+        """Start a pull loop for every new peer, stop the loops of peers that left."""
+        for name in self.peers.keys() - self._peer_tasks.keys():
+            self._peer_tasks[name] = asyncio.create_task(
+                self._loop(lambda name=name: self.pull_peer(name), settings.PULL_INTERVAL,
+                           name=f"pull from {name}"))
+        for name in self._peer_tasks.keys() - self.peers.keys():
+            self._peer_tasks.pop(name).cancel()
+
+    async def pull_peer(self, name: str) -> None:
+        url = self.peers[name]   # read each round: a peer may come back on a new address
+        try:
+            if name in self._reconcile_now:
+                await self.reconcile_with(name, url)
+                self._reconcile_now.discard(name)
+            applied = await self.pull_from(name, url)
+            self.status.setdefault(name, {}).update(
+                url=url, reachable=True, caught_up=True, last_pull=time.time())
+            if applied:
+                self._last_applied = time.time()
+                log.info("pulled %d change(s) from %s", applied, name)
+        except httpx.HTTPError as exc:
+            self.status.setdefault(name, {}).update(url=url, reachable=False,
+                                                    error=str(exc))
 
     async def pull_from(self, name: str, url: str) -> int:
         # [RO] Exemplu: ultima dată am primit de la node2 până la nr. 17 (salvat în baza
@@ -167,11 +182,15 @@ class Syncer:
 
     # ---------- periodic full reconciliation ----------
     async def reconcile_all(self) -> None:
-        for name, url in list(self.peers.items()):
-            try:
-                await self.reconcile_with(name, url)
-            except httpx.HTTPError as exc:
-                log.warning("reconcile with %s failed: %s", name, exc)
+        # [RO] În paralel, din același motiv ca la pull: un peer lent nu-i amână pe ceilalți.
+        await asyncio.gather(*(self._reconcile_safely(name, url)
+                               for name, url in list(self.peers.items())))
+
+    async def _reconcile_safely(self, name: str, url: str) -> None:
+        try:
+            await self.reconcile_with(name, url)
+        except httpx.HTTPError as exc:
+            log.warning("reconcile with %s failed: %s", name, exc)
 
     async def reconcile_with(self, name: str, url: str) -> int:
         """Compare (id, version, node) lists and copy every record the peer has newer."""

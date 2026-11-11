@@ -191,15 +191,16 @@ The proxy caches JSON answers to `GET /movies…` (key: path + query).
 | Situation | Behaviour |
 |---|---|
 | Normal | a fresh copy is served for **5 s** (`X-Cache-Status: HIT`). Only one request refills an expired entry; the others wait for it, so a popular page cannot overload the servers |
-| Any successful POST/PUT/DELETE through the proxy | the whole cache is cleared, so users see their changes right away |
+| Any successful POST/PUT/DELETE through the proxy | the whole cache is cleared. For the next **5 s** (`write_settle_s`, about two sync rounds) reads go to the server that made the write and nothing is cached, so users see their own change right away and an older copy from a server that has not pulled it yet can never be cached |
 | One server or database down | no visible effect: hits never touch a server, and misses go to a healthy one |
 | **All** servers down | a copy up to **60 s** old is served instead of an error (`X-Cache-Status: STALE`). Uncached pages and all writes get 503 |
 | Servers back | the next request after the 5 s freshness window fetches new data (`MISS`). Stale copies are never preferred over a working server |
 | Bypass | XML requests and `Cache-Control: no-cache` are never cached (the web client's *Edit* uses no-cache to get the latest version) |
 
-Times are in `config.json` (`cache_ttl_s`, `stale_ttl_s`). The cache lives in the proxy's memory,
-so it is empty after a proxy restart. Even with the cache cleared, a read right after a write can
-reach a server that has not pulled the change yet (≤ 2 s, see section 11).
+Times are in `config.json` (`cache_ttl_s`, `stale_ttl_s`, `write_settle_s`). The cache lives in the
+proxy's memory, so it is empty after a proxy restart. If the server that made the write goes down
+during those 5 s, reads fall back to the other servers, which may still lack the change for up to
+~2 s (see section 11).
 
 ## 9. Testing server and database failures
 
