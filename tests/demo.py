@@ -7,6 +7,7 @@ also asks the registrar for the node addresses and compares the nodes directly
 (a normal client never does that).
 """
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 
@@ -79,15 +80,32 @@ def main() -> None:
     title("7. Conflict: two nodes edit the same movie at the same time")
     names = sorted(found)[:2]
     if len(names) == 2:
-        current = ok.json()["version"]
-        for name in names:   # both start from the same version -> real conflict
-            httpx.put(f"{found[name]}/movies/{movie['id']}",
-                      json={"title": f"edited on {name}"}, headers={"If-Match": f'"{current}"'})
-        wait_in_sync()
+        clients = {name: httpx.Client(base_url=found[name], timeout=10) for name in names}
+
+        def edit(name: str, version: int) -> int:
+            return clients[name].put(f"/movies/{movie['id']}", json={"title": f"edited on {name}"},
+                                     headers={"If-Match": f'"{version}"'}).status_code
+
+        # Both edits must start from the same version and be sent AT THE SAME TIME:
+        # sent one after the other, the second node may already have pulled the first
+        # edit and answers 409, so there is no conflict to resolve.
+        for attempt in range(1, 6):
+            current = clients[names[0]].get(f"/movies/{movie['id']}").json()["version"]
+            with ThreadPoolExecutor(len(names)) as pool:
+                codes = dict(zip(names, pool.map(lambda n: edit(n, current), names)))
+            print(f"  attempt {attempt}: both edit version {current} ->", codes)
+            wait_in_sync()
+            if all(c == 200 for c in codes.values()):
+                break
+        else:
+            raise SystemExit("could not produce a simultaneous edit on two nodes")
+        for c in clients.values():
+            c.close()
         for name, url in nodes().items():
             d = httpx.get(f"{url}/movies/{movie['id']}").json()
             print(f"  {name}: title={d['title']!r} version={d['version']} node={d['node']}")
-        print("  -> every node kept the same winner (higher version, then higher node name)")
+        winner = max(names)   # same version on both, so the higher node name wins
+        print(f"  -> every node kept the same winner, {winner} (same version, higher node name)")
 
     title("8. Delete (soft delete, synced like any change)")
     print("  delete ->", http.delete(f"/movies/{movie['id']}").status_code)

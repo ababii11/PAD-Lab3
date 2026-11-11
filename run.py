@@ -283,6 +283,9 @@ def cmd_stop(wipe: bool) -> None:
 
 
 def main() -> None:
+    # The status dots (●) are not in legacy code pages such as cp1251, which Python uses
+    # when output is piped or redirected on Windows: always write UTF-8 instead of crashing.
+    sys.stdout.reconfigure(encoding="utf-8")
     ap = argparse.ArgumentParser(description="Smart Proxy lab launcher")
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("start")
